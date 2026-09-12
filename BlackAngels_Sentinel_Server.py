@@ -713,6 +713,89 @@ def disconnect_user(username):
         conn.close()
 
 
+@APP.delete("/api/admin/users/<username>")
+@require_admin
+def delete_user(username):
+    if username == request.auth_session["username"]:
+        return jsonify({"ok": False, "error": "cannot delete yourself"}), 400
+
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+
+        if not row:
+            return jsonify({"ok": False, "error": "user not found"}), 404
+
+        user_id = row["id"]
+
+        conn.execute(
+            "DELETE FROM sessions WHERE user_id=?",
+            (user_id,),
+        )
+        conn.execute(
+            "DELETE FROM users WHERE id=?",
+            (user_id,),
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@APP.post("/api/admin/users/<username>/username")
+@require_admin
+def change_username(username):
+    if username == request.auth_session["username"]:
+        return jsonify({"ok": False, "error": "cannot rename yourself while logged in"}), 400
+
+    data = request.get_json(silent=True) or {}
+    new_username = str(data.get("username", "")).strip()
+
+    if len(new_username) < 2:
+        return jsonify({"ok": False, "error": "username too short"}), 400
+    if len(new_username) > 64:
+        return jsonify({"ok": False, "error": "username too long"}), 400
+
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "user not found"}), 404
+
+        exists = conn.execute(
+            "SELECT id FROM users WHERE username=?",
+            (new_username,),
+        ).fetchone()
+        if exists:
+            return jsonify({"ok": False, "error": "username already exists"}), 409
+
+        user_id = row["id"]
+        conn.execute(
+            "UPDATE users SET username=? WHERE id=?",
+            (new_username, user_id),
+        )
+        conn.execute(
+            "UPDATE sessions SET revoked=1 WHERE user_id=?",
+            (user_id,),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "username": new_username})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @APP.post("/api/admin/users/<username>/password")
 @require_admin
 def change_password(username):
