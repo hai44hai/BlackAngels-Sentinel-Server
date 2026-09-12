@@ -249,6 +249,15 @@ def init_db():
                 "gate_names": {},
                 "map_names": {},
                 "active_map": "Goldfields",
+                "updates": {
+                    "published": False,
+                    "latest_version": "V43",
+                    "minimum_version": "V43",
+                    "force_update": False,
+                    "download_url": "",
+                    "sha256": "",
+                    "message": "",
+                },
             }
             conn.execute(
                 "INSERT INTO app_config (id, config_json, updated_at) VALUES (1, ?, ?)",
@@ -342,12 +351,117 @@ def _load_config(conn):
             "gate_names": {},
             "map_names": {},
             "active_map": "Goldfields",
+            "updates": {
+                "published": False,
+                "latest_version": "V43",
+                "minimum_version": "V43",
+                "force_update": False,
+                "download_url": "",
+                "sha256": "",
+                "message": "",
+            },
         }
     try:
         data = json.loads(row["config_json"] or "{}")
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _version_tuple(value):
+    """Convert V44 / 44.1 / USER_V43_... into a comparable integer tuple."""
+    import re
+    nums = re.findall(r"\d+", str(value or ""))
+    if not nums:
+        return (0,)
+    return tuple(int(x) for x in nums[:4])
+
+
+def _update_settings(cfg):
+    raw = cfg.get("updates") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "published": bool(raw.get("published", False)),
+        "latest_version": str(raw.get("latest_version", "V43") or "V43"),
+        "minimum_version": str(raw.get("minimum_version", "V43") or "V43"),
+        "force_update": bool(raw.get("force_update", False)),
+        "download_url": str(raw.get("download_url", "") or ""),
+        "sha256": str(raw.get("sha256", "") or "").strip().lower(),
+        "message": str(raw.get("message", "") or ""),
+    }
+
+
+@APP.get("/api/version")
+def public_version():
+    conn = db()
+    try:
+        cfg = _load_config(conn)
+        return jsonify({"ok": True, "update": _update_settings(cfg)})
+    finally:
+        conn.close()
+
+
+@APP.get("/api/admin/update-config")
+@require_admin
+def admin_get_update_config():
+    conn = db()
+    try:
+        cfg = _load_config(conn)
+        return jsonify({"ok": True, "update": _update_settings(cfg)})
+    finally:
+        conn.close()
+
+
+@APP.post("/api/admin/update-config")
+@require_admin
+def admin_set_update_config():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "invalid update config"}), 400
+
+    latest = str(data.get("latest_version", "V43") or "V43").strip()
+    minimum = str(data.get("minimum_version", "V43") or "V43").strip()
+    download_url = str(data.get("download_url", "") or "").strip()
+    sha256 = str(data.get("sha256", "") or "").strip().lower()
+    message = str(data.get("message", "") or "")[:1000]
+    published = bool(data.get("published", False))
+    force_update = bool(data.get("force_update", False))
+
+    if not latest or not minimum:
+        return jsonify({"ok": False, "error": "latest/minimum version required"}), 400
+    if _version_tuple(minimum) > _version_tuple(latest):
+        return jsonify({"ok": False, "error": "minimum version cannot be newer than latest version"}), 400
+    if published and not download_url:
+        return jsonify({"ok": False, "error": "download URL required before publishing"}), 400
+    if sha256 and (len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256)):
+        return jsonify({"ok": False, "error": "sha256 must be 64 hexadecimal characters"}), 400
+
+    update_cfg = {
+        "published": published,
+        "latest_version": latest,
+        "minimum_version": minimum,
+        "force_update": force_update,
+        "download_url": download_url,
+        "sha256": sha256,
+        "message": message,
+    }
+
+    conn = db()
+    try:
+        cfg = _load_config(conn)
+        cfg["updates"] = update_cfg
+        conn.execute(
+            "UPDATE app_config SET config_json=?, updated_at=? WHERE id=1",
+            (json.dumps(cfg, ensure_ascii=False), now_iso()),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "update": update_cfg})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @APP.get("/api/config")
@@ -413,6 +527,25 @@ def login():
 
     conn = db()
     try:
+        client_version = str(data.get("version", ""))
+        # ADMIN builds stay able to sign in so the owner cannot lock himself out.
+        if not client_version.upper().startswith("ADMIN_"):
+            cfg = _load_config(conn)
+            update_cfg = _update_settings(cfg)
+            if update_cfg["published"]:
+                required = (
+                    update_cfg["latest_version"]
+                    if update_cfg["force_update"]
+                    else update_cfg["minimum_version"]
+                )
+                if _version_tuple(client_version) < _version_tuple(required):
+                    return jsonify({
+                        "ok": False,
+                        "error": "update required",
+                        "update_required": True,
+                        "update": update_cfg,
+                    }), 426
+
         user = conn.execute(
             "SELECT * FROM users WHERE username=?",
             (username,),
