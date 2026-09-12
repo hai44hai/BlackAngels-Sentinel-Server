@@ -9,24 +9,36 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.errors
+except Exception:
+    psycopg2 = None
+
 APP = Flask(__name__)
 
 # =========================================================
 # STORAGE
 # =========================================================
-# IMPORTANT:
-# - On Render Free, the local filesystem is temporary.
-# - If a persistent disk is mounted at /var/data, this server automatically
-#   stores the database there.
-# - You can also override the path with BA_SENTINEL_DB.
+# Primary storage:
+#   DATABASE_URL -> PostgreSQL / Neon (persistent)
+# Fallback storage:
+#   BA_SENTINEL_DB or local SQLite (only used when DATABASE_URL is absent)
+#
+# IMPORTANT: never hard-code the Neon connection string in this file.
+# Put it in Render -> Environment as DATABASE_URL.
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 if os.environ.get("BA_SENTINEL_DB"):
-    DB_PATH = os.environ["BA_SENTINEL_DB"]
+    SQLITE_PATH = os.environ["BA_SENTINEL_DB"]
 elif os.path.isdir("/var/data"):
-    DB_PATH = "/var/data/sentinel_admin.db"
+    SQLITE_PATH = "/var/data/sentinel_admin.db"
 else:
-    DB_PATH = "sentinel_admin.db"
+    SQLITE_PATH = "sentinel_admin.db"
 
+USE_POSTGRES = bool(DATABASE_URL)
 ONLINE_SECONDS = 45
 
 
@@ -34,110 +46,221 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+class DBResult:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        return row
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+
+class DBConnection:
+    def __init__(self):
+        self.is_postgres = USE_POSTGRES
+
+        if self.is_postgres:
+            if psycopg2 is None:
+                raise RuntimeError(
+                    "DATABASE_URL is set but psycopg2 is not installed. "
+                    "Install psycopg2-binary from requirements.txt."
+                )
+            self.conn = psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=15,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+            self.conn.autocommit = False
+        else:
+            self.conn = sqlite3.connect(SQLITE_PATH, timeout=20)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _sql(self, sql):
+        # Existing server queries use SQLite-style ? placeholders.
+        # PostgreSQL/psycopg2 uses %s.
+        if self.is_postgres:
+            return sql.replace("?", "%s")
+        return sql
+
+    def execute(self, sql, params=()):
+        cur = self.conn.cursor()
+        cur.execute(self._sql(sql), params)
+        return DBResult(cur)
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return DBConnection()
 
 
 def init_db():
     conn = db()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
+    try:
+        if conn.is_postgres:
+            statements = [
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id),
+                    device TEXT,
+                    version TEXT,
+                    last_seen DOUBLE PRECISION NOT NULL,
+                    last_seen_iso TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    running INTEGER NOT NULL DEFAULT 0,
+                    gate_states TEXT NOT NULL DEFAULT '{}',
+                    goldfields_score DOUBLE PRECISION NOT NULL DEFAULT 0
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    event_type TEXT NOT NULL,
+                    gate_name TEXT,
+                    details TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS app_config (
+                    id INTEGER PRIMARY KEY,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    CHECK (id = 1)
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_sessions_user_last_seen ON sessions(user_id, last_seen DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_events_id_desc ON events(id DESC)",
+            ]
+            for stmt in statements:
+                conn.execute(stmt)
+        else:
+            conn.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
 
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            device TEXT,
-            version TEXT,
-            last_seen REAL NOT NULL,
-            last_seen_iso TEXT NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            running INTEGER NOT NULL DEFAULT 0,
-            gate_states TEXT NOT NULL DEFAULT '{}',
-            goldfields_score REAL NOT NULL DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    device TEXT,
+                    version TEXT,
+                    last_seen REAL NOT NULL,
+                    last_seen_iso TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    running INTEGER NOT NULL DEFAULT 0,
+                    gate_states TEXT NOT NULL DEFAULT '{}',
+                    goldfields_score REAL NOT NULL DEFAULT 0,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
 
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            event_type TEXT NOT NULL,
-            gate_name TEXT,
-            details TEXT,
-            created_at TEXT NOT NULL
-        );
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    event_type TEXT NOT NULL,
+                    gate_name TEXT,
+                    details TEXT,
+                    created_at TEXT NOT NULL
+                );
 
-        CREATE TABLE IF NOT EXISTS app_config (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            config_json TEXT NOT NULL DEFAULT '{}',
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    # Bootstrap ADMIN ONLY when it does not exist.
-    # After creation, changing the admin password from the ADMIN application
-    # is permanent and is NOT overwritten on server restart/deploy.
-    admin_user = os.environ.get("BA_ADMIN_USER", "blackangels").strip()
-    admin_pass = os.environ.get("BA_ADMIN_PASSWORD", "")
-
-    exists = conn.execute(
-        "SELECT id FROM users WHERE username=?",
-        (admin_user,),
-    ).fetchone()
-
-    if not exists:
-        if not admin_pass:
-            conn.close()
-            raise RuntimeError(
-                "BA_ADMIN_PASSWORD is required the first time the database is created"
+                CREATE TABLE IF NOT EXISTS app_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                """
             )
 
+        # Bootstrap admin only if it doesn't already exist.
+        # Once created, changing its password from the ADMIN app is permanent.
+        admin_user = os.environ.get("BA_ADMIN_USER", "blackangels").strip()
+        admin_pass = os.environ.get("BA_ADMIN_PASSWORD", "")
+
+        exists = conn.execute(
+            "SELECT id FROM users WHERE username=?",
+            (admin_user,),
+        ).fetchone()
+
+        if not exists:
+            if not admin_pass:
+                raise RuntimeError(
+                    "BA_ADMIN_PASSWORD is required the first time the database is created"
+                )
+
+            conn.execute(
+                """
+                INSERT INTO users
+                (username, password_hash, role, enabled, created_at)
+                VALUES (?, ?, 'admin', 1, ?)
+                """,
+                (
+                    admin_user,
+                    generate_password_hash(admin_pass),
+                    now_iso(),
+                ),
+            )
+
+        # Keep bootstrap account enabled/admin, but never overwrite its password.
         conn.execute(
-            """
-            INSERT INTO users
-            (username, password_hash, role, enabled, created_at)
-            VALUES (?, ?, 'admin', 1, ?)
-            """,
-            (
-                admin_user,
-                generate_password_hash(admin_pass),
-                now_iso(),
-            ),
+            "UPDATE users SET role='admin', enabled=1 WHERE username=?",
+            (admin_user,),
         )
 
-    # Make sure the bootstrap account keeps admin privileges, but DO NOT touch
-    # its password after it already exists.
-    conn.execute(
-        "UPDATE users SET role='admin', enabled=1 WHERE username=?",
-        (admin_user,),
-    )
+        row = conn.execute("SELECT id FROM app_config WHERE id=1").fetchone()
+        if not row:
+            default_config = {
+                "gate_names": {},
+                "map_names": {},
+                "active_map": "Goldfields",
+            }
+            conn.execute(
+                "INSERT INTO app_config (id, config_json, updated_at) VALUES (1, ?, ?)",
+                (json.dumps(default_config), now_iso()),
+            )
 
-    row = conn.execute("SELECT id FROM app_config WHERE id=1").fetchone()
-    if not row:
-        default_config = {
-            "gate_names": {},
-            "map_names": {},
-            "active_map": "Goldfields",
-        }
-        conn.execute(
-            "INSERT INTO app_config (id, config_json, updated_at) VALUES (1, ?, ?)",
-            (json.dumps(default_config), now_iso()),
-        )
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def bearer():
@@ -153,21 +276,23 @@ def current_session():
         return None
 
     conn = db()
-    row = conn.execute(
-        """
-        SELECT
-            s.*,
-            u.username,
-            u.role,
-            u.enabled
-        FROM sessions s
-        JOIN users u ON u.id=s.user_id
-        WHERE s.token=?
-        """,
-        (token,),
-    ).fetchone()
-    conn.close()
-    return row
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                s.*,
+                u.username,
+                u.role,
+                u.enabled
+            FROM sessions s
+            JOIN users u ON u.id=s.user_id
+            WHERE s.token=?
+            """,
+            (token,),
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
 
 
 def require_auth(fn):
@@ -203,7 +328,7 @@ def index():
         {
             "ok": True,
             "service": "BlackAngels Sentinel Admin Server",
-            "storage": DB_PATH,
+            "storage": "postgresql" if USE_POSTGRES else "sqlite-fallback",
         }
     )
 
@@ -228,9 +353,11 @@ def _load_config(conn):
 @APP.get("/api/config")
 def get_config():
     conn = db()
-    cfg = _load_config(conn)
-    conn.close()
-    return jsonify({"ok": True, "config": cfg})
+    try:
+        cfg = _load_config(conn)
+        return jsonify({"ok": True, "config": cfg})
+    finally:
+        conn.close()
 
 
 @APP.post("/api/admin/config")
@@ -241,33 +368,37 @@ def update_config():
         return jsonify({"ok": False, "error": "invalid config"}), 400
 
     conn = db()
-    cfg = _load_config(conn)
+    try:
+        cfg = _load_config(conn)
 
-    # Merge only known config sections used by Sentinel.
-    if isinstance(patch.get("gate_names"), dict):
-        current = cfg.get("gate_names")
-        if not isinstance(current, dict):
-            current = {}
-        current.update({str(k): str(v) for k, v in patch["gate_names"].items()})
-        cfg["gate_names"] = current
+        if isinstance(patch.get("gate_names"), dict):
+            current = cfg.get("gate_names")
+            if not isinstance(current, dict):
+                current = {}
+            current.update({str(k): str(v) for k, v in patch["gate_names"].items()})
+            cfg["gate_names"] = current
 
-    if isinstance(patch.get("map_names"), dict):
-        current = cfg.get("map_names")
-        if not isinstance(current, dict):
-            current = {}
-        current.update({str(k): str(v) for k, v in patch["map_names"].items()})
-        cfg["map_names"] = current
+        if isinstance(patch.get("map_names"), dict):
+            current = cfg.get("map_names")
+            if not isinstance(current, dict):
+                current = {}
+            current.update({str(k): str(v) for k, v in patch["map_names"].items()})
+            cfg["map_names"] = current
 
-    if "active_map" in patch:
-        cfg["active_map"] = str(patch.get("active_map", "Goldfields"))
+        if "active_map" in patch:
+            cfg["active_map"] = str(patch.get("active_map", "Goldfields"))
 
-    conn.execute(
-        "UPDATE app_config SET config_json=?, updated_at=? WHERE id=1",
-        (json.dumps(cfg, ensure_ascii=False), now_iso()),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "config": cfg})
+        conn.execute(
+            "UPDATE app_config SET config_json=?, updated_at=? WHERE id=1",
+            (json.dumps(cfg, ensure_ascii=False), now_iso()),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "config": cfg})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # =========================================================
@@ -281,47 +412,51 @@ def login():
     password = str(data.get("password", ""))
 
     conn = db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE username=?",
-        (username,),
-    ).fetchone()
+    try:
+        user = conn.execute(
+            "SELECT * FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
 
-    if (
-        not user
-        or not user["enabled"]
-        or not check_password_hash(user["password_hash"], password)
-    ):
+        if (
+            not user
+            or not user["enabled"]
+            or not check_password_hash(user["password_hash"], password)
+        ):
+            return jsonify({"ok": False, "error": "invalid login"}), 401
+
+        token = secrets.token_urlsafe(32)
+
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (token, user_id, device, version, last_seen, last_seen_iso, revoked)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                token,
+                user["id"],
+                str(data.get("device", ""))[:250],
+                str(data.get("version", ""))[:100],
+                time.time(),
+                now_iso(),
+            ),
+        )
+        conn.commit()
+
+        return jsonify(
+            {
+                "ok": True,
+                "token": token,
+                "username": user["username"],
+                "role": user["role"],
+            }
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return jsonify({"ok": False, "error": "invalid login"}), 401
-
-    token = secrets.token_urlsafe(32)
-
-    conn.execute(
-        """
-        INSERT INTO sessions
-        (token, user_id, device, version, last_seen, last_seen_iso, revoked)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
-        """,
-        (
-            token,
-            user["id"],
-            str(data.get("device", ""))[:250],
-            str(data.get("version", ""))[:100],
-            time.time(),
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify(
-        {
-            "ok": True,
-            "token": token,
-            "username": user["username"],
-            "role": user["role"],
-        }
-    )
 
 
 @APP.post("/api/logout")
@@ -329,10 +464,15 @@ def login():
 def logout():
     token = bearer()
     conn = db()
-    conn.execute("UPDATE sessions SET revoked=1 WHERE token=?", (token,))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
+    try:
+        conn.execute("UPDATE sessions SET revoked=1 WHERE token=?", (token,))
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @APP.post("/api/heartbeat")
@@ -342,35 +482,39 @@ def heartbeat():
     token = bearer()
 
     conn = db()
-    conn.execute(
-        """
-        UPDATE sessions
-        SET
-            device=?,
-            version=?,
-            last_seen=?,
-            last_seen_iso=?,
-            running=?,
-            gate_states=?,
-            goldfields_score=?
-        WHERE token=?
-        """,
-        (
-            str(data.get("device", ""))[:250],
-            str(data.get("version", ""))[:100],
-            time.time(),
-            now_iso(),
-            1 if data.get("running") else 0,
-            json.dumps(data.get("gate_states", {})),
-            float(data.get("goldfields_score", 0.0)),
-            token,
-        ),
-    )
-    conn.commit()
-
-    cfg = _load_config(conn)
-    conn.close()
-    return jsonify({"ok": True, "config": cfg})
+    try:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET
+                device=?,
+                version=?,
+                last_seen=?,
+                last_seen_iso=?,
+                running=?,
+                gate_states=?,
+                goldfields_score=?
+            WHERE token=?
+            """,
+            (
+                str(data.get("device", ""))[:250],
+                str(data.get("version", ""))[:100],
+                time.time(),
+                now_iso(),
+                1 if data.get("running") else 0,
+                json.dumps(data.get("gate_states", {})),
+                float(data.get("goldfields_score", 0.0)),
+                token,
+            ),
+        )
+        conn.commit()
+        cfg = _load_config(conn)
+        return jsonify({"ok": True, "config": cfg})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @APP.post("/api/events")
@@ -380,24 +524,29 @@ def add_event():
     row = request.auth_session
 
     conn = db()
-    conn.execute(
-        """
-        INSERT INTO events
-        (user_id, username, event_type, gate_name, details, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            row["user_id"],
-            row["username"],
-            str(data.get("event_type", ""))[:100],
-            str(data.get("gate_name", ""))[:100],
-            str(data.get("details", ""))[:500],
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
+    try:
+        conn.execute(
+            """
+            INSERT INTO events
+            (user_id, username, event_type, gate_name, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["user_id"],
+                row["username"],
+                str(data.get("event_type", ""))[:100],
+                str(data.get("gate_name", ""))[:100],
+                str(data.get("details", ""))[:500],
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # =========================================================
@@ -408,45 +557,46 @@ def add_event():
 @require_admin
 def admin_users():
     conn = db()
+    try:
+        users = conn.execute(
+            "SELECT id, username, role, enabled, created_at FROM users ORDER BY username"
+        ).fetchall()
 
-    users = conn.execute(
-        "SELECT id, username, role, enabled, created_at FROM users ORDER BY username"
-    ).fetchall()
+        result = []
+        cutoff = time.time() - ONLINE_SECONDS
 
-    result = []
-    cutoff = time.time() - ONLINE_SECONDS
+        for user in users:
+            session = conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE user_id=? AND revoked=0
+                ORDER BY last_seen DESC
+                LIMIT 1
+                """,
+                (user["id"],),
+            ).fetchone()
 
-    for user in users:
-        session = conn.execute(
-            """
-            SELECT *
-            FROM sessions
-            WHERE user_id=? AND revoked=0
-            ORDER BY last_seen DESC
-            LIMIT 1
-            """,
-            (user["id"],),
-        ).fetchone()
+            online = bool(
+                user["enabled"] and session and session["last_seen"] >= cutoff
+            )
 
-        online = bool(
-            user["enabled"] and session and session["last_seen"] >= cutoff
-        )
+            result.append(
+                {
+                    "username": user["username"],
+                    "role": user["role"],
+                    "enabled": bool(user["enabled"]),
+                    "online": online,
+                    "device": session["device"] if session else "",
+                    "last_seen": session["last_seen_iso"] if session else "",
+                    "version": session["version"] if session else "",
+                    "running": bool(session["running"]) if session else False,
+                }
+            )
 
-        result.append(
-            {
-                "username": user["username"],
-                "role": user["role"],
-                "enabled": bool(user["enabled"]),
-                "online": online,
-                "device": session["device"] if session else "",
-                "last_seen": session["last_seen_iso"] if session else "",
-                "version": session["version"] if session else "",
-                "running": bool(session["running"]) if session else False,
-            }
-        )
-
-    conn.close()
-    return jsonify({"ok": True, "users": result})
+        return jsonify({"ok": True, "users": result})
+    finally:
+        conn.close()
 
 
 @APP.post("/api/admin/users")
@@ -487,11 +637,18 @@ def create_user():
             ),
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except Exception as e:
+        conn.rollback()
+        # Duplicate username: SQLite and PostgreSQL report different exception types.
+        duplicate = isinstance(e, sqlite3.IntegrityError)
+        if psycopg2 is not None and isinstance(e, psycopg2.IntegrityError):
+            duplicate = True
+        if duplicate:
+            return jsonify({"ok": False, "error": "username already exists"}), 409
+        raise
+    finally:
         conn.close()
-        return jsonify({"ok": False, "error": "username already exists"}), 409
 
-    conn.close()
     return jsonify({"ok": True})
 
 
@@ -502,22 +659,44 @@ def toggle_user(username):
         return jsonify({"ok": False, "error": "cannot disable yourself"}), 400
 
     conn = db()
-    row = conn.execute(
-        "SELECT enabled FROM users WHERE username=?",
-        (username,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT enabled FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
 
-    if not row:
+        if not row:
+            return jsonify({"ok": False, "error": "user not found"}), 404
+
+        new_value = 0 if row["enabled"] else 1
+        conn.execute(
+            "UPDATE users SET enabled=? WHERE username=?",
+            (new_value, username),
+        )
+
+        if new_value == 0:
+            conn.execute(
+                """
+                UPDATE sessions SET revoked=1
+                WHERE user_id=(SELECT id FROM users WHERE username=?)
+                """,
+                (username,),
+            )
+
+        conn.commit()
+        return jsonify({"ok": True, "enabled": bool(new_value)})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return jsonify({"ok": False, "error": "user not found"}), 404
 
-    new_value = 0 if row["enabled"] else 1
-    conn.execute(
-        "UPDATE users SET enabled=? WHERE username=?",
-        (new_value, username),
-    )
 
-    if new_value == 0:
+@APP.post("/api/admin/users/<username>/disconnect")
+@require_admin
+def disconnect_user(username):
+    conn = db()
+    try:
         conn.execute(
             """
             UPDATE sessions SET revoked=1
@@ -525,26 +704,13 @@ def toggle_user(username):
             """,
             (username,),
         )
-
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "enabled": bool(new_value)})
-
-
-@APP.post("/api/admin/users/<username>/disconnect")
-@require_admin
-def disconnect_user(username):
-    conn = db()
-    conn.execute(
-        """
-        UPDATE sessions SET revoked=1
-        WHERE user_id=(SELECT id FROM users WHERE username=?)
-        """,
-        (username,),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @APP.post("/api/admin/users/<username>/password")
@@ -557,28 +723,32 @@ def change_password(username):
         return jsonify({"ok": False, "error": "password too short"}), 400
 
     conn = db()
-    cur = conn.execute(
-        "UPDATE users SET password_hash=? WHERE username=?",
-        (generate_password_hash(password), username),
-    )
+    try:
+        cur = conn.execute(
+            "UPDATE users SET password_hash=? WHERE username=?",
+            (generate_password_hash(password), username),
+        )
 
-    # Revoke other sessions for this user so the new password takes effect cleanly.
-    conn.execute(
-        """
-        UPDATE sessions SET revoked=1
-        WHERE user_id=(SELECT id FROM users WHERE username=?)
-          AND token<>?
-        """,
-        (username, bearer() or ""),
-    )
+        conn.execute(
+            """
+            UPDATE sessions SET revoked=1
+            WHERE user_id=(SELECT id FROM users WHERE username=?)
+              AND token<>?
+            """,
+            (username, bearer() or ""),
+        )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    if cur.rowcount == 0:
-        return jsonify({"ok": False, "error": "user not found"}), 404
+        if cur.rowcount == 0:
+            return jsonify({"ok": False, "error": "user not found"}), 404
 
-    return jsonify({"ok": True})
+        return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # =========================================================
@@ -589,22 +759,24 @@ def change_password(username):
 @require_admin
 def admin_events():
     conn = db()
-    rows = conn.execute(
-        """
-        SELECT username, event_type, gate_name, details, created_at
-        FROM events
-        ORDER BY id DESC
-        LIMIT 300
-        """
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """
+            SELECT username, event_type, gate_name, details, created_at
+            FROM events
+            ORDER BY id DESC
+            LIMIT 300
+            """
+        ).fetchall()
 
-    return jsonify(
-        {
-            "ok": True,
-            "events": [dict(row) for row in rows],
-        }
-    )
+        return jsonify(
+            {
+                "ok": True,
+                "events": [dict(row) for row in rows],
+            }
+        )
+    finally:
+        conn.close()
 
 
 # =========================================================
@@ -615,6 +787,6 @@ init_db()
 
 if __name__ == "__main__":
     print("BlackAngels Sentinel Admin Server")
-    print("Database:", DB_PATH)
+    print("Storage:", "PostgreSQL / Neon" if USE_POSTGRES else "SQLite fallback")
     print("Bootstrap admin:", os.environ.get("BA_ADMIN_USER", "blackangels"))
     APP.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
