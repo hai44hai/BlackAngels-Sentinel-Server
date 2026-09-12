@@ -10,7 +10,23 @@ from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 APP = Flask(__name__)
-DB_PATH = os.environ.get("BA_SENTINEL_DB", "sentinel_admin.db")
+
+# =========================================================
+# STORAGE
+# =========================================================
+# IMPORTANT:
+# - On Render Free, the local filesystem is temporary.
+# - If a persistent disk is mounted at /var/data, this server automatically
+#   stores the database there.
+# - You can also override the path with BA_SENTINEL_DB.
+
+if os.environ.get("BA_SENTINEL_DB"):
+    DB_PATH = os.environ["BA_SENTINEL_DB"]
+elif os.path.isdir("/var/data"):
+    DB_PATH = "/var/data/sentinel_admin.db"
+else:
+    DB_PATH = "sentinel_admin.db"
+
 ONLINE_SECONDS = 45
 
 
@@ -21,83 +37,104 @@ def now_iso():
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db():
     conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'user',
-        enabled INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL
-    );
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
 
-    CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        device TEXT,
-        version TEXT,
-        last_seen REAL NOT NULL,
-        last_seen_iso TEXT NOT NULL,
-        revoked INTEGER NOT NULL DEFAULT 0,
-        running INTEGER NOT NULL DEFAULT 0,
-        gate_states TEXT NOT NULL DEFAULT '{}',
-        goldfields_score REAL NOT NULL DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            device TEXT,
+            version TEXT,
+            last_seen REAL NOT NULL,
+            last_seen_iso TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            running INTEGER NOT NULL DEFAULT 0,
+            gate_states TEXT NOT NULL DEFAULT '{}',
+            goldfields_score REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
 
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        event_type TEXT NOT NULL,
-        gate_name TEXT,
-        details TEXT,
-        created_at TEXT NOT NULL
-    );
-    """)
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            event_type TEXT NOT NULL,
+            gate_name TEXT,
+            details TEXT,
+            created_at TEXT NOT NULL
+        );
 
-    # Bootstrap admin from environment.
-    admin_user = os.environ.get("BA_ADMIN_USER", "blackangels")
-    admin_pass = os.environ.get("BA_ADMIN_PASSWORD", "famliyonly1")
+        CREATE TABLE IF NOT EXISTS app_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
 
-    if admin_pass:
-        exists = conn.execute(
-            "SELECT id FROM users WHERE username=?",
-            (admin_user,)
-        ).fetchone()
+    # Bootstrap ADMIN ONLY when it does not exist.
+    # After creation, changing the admin password from the ADMIN application
+    # is permanent and is NOT overwritten on server restart/deploy.
+    admin_user = os.environ.get("BA_ADMIN_USER", "blackangels").strip()
+    admin_pass = os.environ.get("BA_ADMIN_PASSWORD", "")
 
-        if not exists:
-            conn.execute(
-                """
-                INSERT INTO users
-                (username, password_hash, role, enabled, created_at)
-                VALUES (?, ?, 'admin', 1, ?)
-                """,
-                (
-                    admin_user,
-                    generate_password_hash(admin_pass),
-                    now_iso()
-                )
+    exists = conn.execute(
+        "SELECT id FROM users WHERE username=?",
+        (admin_user,),
+    ).fetchone()
+
+    if not exists:
+        if not admin_pass:
+            conn.close()
+            raise RuntimeError(
+                "BA_ADMIN_PASSWORD is required the first time the database is created"
             )
-        else:
-            # Keep the bootstrap admin usable even if the database already
-            # existed with an older password.
-            conn.execute(
-                """
-                UPDATE users
-                SET password_hash=?, role='admin', enabled=1
-                WHERE username=?
-                """,
-                (
-                    generate_password_hash(admin_pass),
-                    admin_user
-                )
-            )
+
+        conn.execute(
+            """
+            INSERT INTO users
+            (username, password_hash, role, enabled, created_at)
+            VALUES (?, ?, 'admin', 1, ?)
+            """,
+            (
+                admin_user,
+                generate_password_hash(admin_pass),
+                now_iso(),
+            ),
+        )
+
+    # Make sure the bootstrap account keeps admin privileges, but DO NOT touch
+    # its password after it already exists.
+    conn.execute(
+        "UPDATE users SET role='admin', enabled=1 WHERE username=?",
+        (admin_user,),
+    )
+
+    row = conn.execute("SELECT id FROM app_config WHERE id=1").fetchone()
+    if not row:
+        default_config = {
+            "gate_names": {},
+            "map_names": {},
+            "active_map": "Goldfields",
+        }
+        conn.execute(
+            "INSERT INTO app_config (id, config_json, updated_at) VALUES (1, ?, ?)",
+            (json.dumps(default_config), now_iso()),
+        )
 
     conn.commit()
     conn.close()
@@ -127,7 +164,7 @@ def current_session():
         JOIN users u ON u.id=s.user_id
         WHERE s.token=?
         """,
-        (token,)
+        (token,),
     ).fetchone()
     conn.close()
     return row
@@ -141,6 +178,7 @@ def require_auth(fn):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         request.auth_session = row
         return fn(*args, **kwargs)
+
     return wrapper
 
 
@@ -151,16 +189,90 @@ def require_admin(fn):
         if request.auth_session["role"] != "admin":
             return jsonify({"ok": False, "error": "admin required"}), 403
         return fn(*args, **kwargs)
+
     return wrapper
 
 
+# =========================================================
+# BASIC / CONFIG
+# =========================================================
+
 @APP.get("/")
 def index():
-    return jsonify({
-        "ok": True,
-        "service": "BlackAngels Sentinel Admin Server"
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "service": "BlackAngels Sentinel Admin Server",
+            "storage": DB_PATH,
+        }
+    )
 
+
+def _load_config(conn):
+    row = conn.execute(
+        "SELECT config_json FROM app_config WHERE id=1"
+    ).fetchone()
+    if not row:
+        return {
+            "gate_names": {},
+            "map_names": {},
+            "active_map": "Goldfields",
+        }
+    try:
+        data = json.loads(row["config_json"] or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@APP.get("/api/config")
+def get_config():
+    conn = db()
+    cfg = _load_config(conn)
+    conn.close()
+    return jsonify({"ok": True, "config": cfg})
+
+
+@APP.post("/api/admin/config")
+@require_admin
+def update_config():
+    patch = request.get_json(silent=True) or {}
+    if not isinstance(patch, dict):
+        return jsonify({"ok": False, "error": "invalid config"}), 400
+
+    conn = db()
+    cfg = _load_config(conn)
+
+    # Merge only known config sections used by Sentinel.
+    if isinstance(patch.get("gate_names"), dict):
+        current = cfg.get("gate_names")
+        if not isinstance(current, dict):
+            current = {}
+        current.update({str(k): str(v) for k, v in patch["gate_names"].items()})
+        cfg["gate_names"] = current
+
+    if isinstance(patch.get("map_names"), dict):
+        current = cfg.get("map_names")
+        if not isinstance(current, dict):
+            current = {}
+        current.update({str(k): str(v) for k, v in patch["map_names"].items()})
+        cfg["map_names"] = current
+
+    if "active_map" in patch:
+        cfg["active_map"] = str(patch.get("active_map", "Goldfields"))
+
+    conn.execute(
+        "UPDATE app_config SET config_json=?, updated_at=? WHERE id=1",
+        (json.dumps(cfg, ensure_ascii=False), now_iso()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "config": cfg})
+
+
+# =========================================================
+# AUTH
+# =========================================================
 
 @APP.post("/api/login")
 def login():
@@ -171,7 +283,7 @@ def login():
     conn = db()
     user = conn.execute(
         "SELECT * FROM users WHERE username=?",
-        (username,)
+        (username,),
     ).fetchone()
 
     if (
@@ -196,18 +308,20 @@ def login():
             str(data.get("device", ""))[:250],
             str(data.get("version", ""))[:100],
             time.time(),
-            now_iso()
-        )
+            now_iso(),
+        ),
     )
     conn.commit()
     conn.close()
 
-    return jsonify({
-        "ok": True,
-        "token": token,
-        "username": user["username"],
-        "role": user["role"]
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "token": token,
+            "username": user["username"],
+            "role": user["role"],
+        }
+    )
 
 
 @APP.post("/api/logout")
@@ -215,10 +329,7 @@ def login():
 def logout():
     token = bearer()
     conn = db()
-    conn.execute(
-        "UPDATE sessions SET revoked=1 WHERE token=?",
-        (token,)
-    )
+    conn.execute("UPDATE sessions SET revoked=1 WHERE token=?", (token,))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -252,12 +363,14 @@ def heartbeat():
             1 if data.get("running") else 0,
             json.dumps(data.get("gate_states", {})),
             float(data.get("goldfields_score", 0.0)),
-            token
-        )
+            token,
+        ),
     )
     conn.commit()
+
+    cfg = _load_config(conn)
     conn.close()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "config": cfg})
 
 
 @APP.post("/api/events")
@@ -279,13 +392,17 @@ def add_event():
             str(data.get("event_type", ""))[:100],
             str(data.get("gate_name", ""))[:100],
             str(data.get("details", ""))[:500],
-            now_iso()
-        )
+            now_iso(),
+        ),
     )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
+
+# =========================================================
+# ADMIN - USERS
+# =========================================================
 
 @APP.get("/api/admin/users")
 @require_admin
@@ -308,25 +425,25 @@ def admin_users():
             ORDER BY last_seen DESC
             LIMIT 1
             """,
-            (user["id"],)
+            (user["id"],),
         ).fetchone()
 
         online = bool(
-            user["enabled"]
-            and session
-            and session["last_seen"] >= cutoff
+            user["enabled"] and session and session["last_seen"] >= cutoff
         )
 
-        result.append({
-            "username": user["username"],
-            "role": user["role"],
-            "enabled": bool(user["enabled"]),
-            "online": online,
-            "device": session["device"] if session else "",
-            "last_seen": session["last_seen_iso"] if session else "",
-            "version": session["version"] if session else "",
-            "running": bool(session["running"]) if session else False
-        })
+        result.append(
+            {
+                "username": user["username"],
+                "role": user["role"],
+                "enabled": bool(user["enabled"]),
+                "online": online,
+                "device": session["device"] if session else "",
+                "last_seen": session["last_seen_iso"] if session else "",
+                "version": session["version"] if session else "",
+                "running": bool(session["running"]) if session else False,
+            }
+        )
 
     conn.close()
     return jsonify({"ok": True, "users": result})
@@ -341,10 +458,15 @@ def create_user():
     role = str(data.get("role", "user")).strip().lower()
 
     if not username or len(password) < 4:
-        return jsonify({
-            "ok": False,
-            "error": "username required and password must be at least 4 characters"
-        }), 400
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "username required and password must be at least 4 characters",
+                }
+            ),
+            400,
+        )
 
     if role not in ("user", "admin"):
         role = "user"
@@ -361,8 +483,8 @@ def create_user():
                 username,
                 generate_password_hash(password),
                 role,
-                now_iso()
-            )
+                now_iso(),
+            ),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -382,7 +504,7 @@ def toggle_user(username):
     conn = db()
     row = conn.execute(
         "SELECT enabled FROM users WHERE username=?",
-        (username,)
+        (username,),
     ).fetchone()
 
     if not row:
@@ -392,7 +514,7 @@ def toggle_user(username):
     new_value = 0 if row["enabled"] else 1
     conn.execute(
         "UPDATE users SET enabled=? WHERE username=?",
-        (new_value, username)
+        (new_value, username),
     )
 
     if new_value == 0:
@@ -401,7 +523,7 @@ def toggle_user(username):
             UPDATE sessions SET revoked=1
             WHERE user_id=(SELECT id FROM users WHERE username=?)
             """,
-            (username,)
+            (username,),
         )
 
     conn.commit()
@@ -418,7 +540,7 @@ def disconnect_user(username):
         UPDATE sessions SET revoked=1
         WHERE user_id=(SELECT id FROM users WHERE username=?)
         """,
-        (username,)
+        (username,),
     )
     conn.commit()
     conn.close()
@@ -437,8 +559,19 @@ def change_password(username):
     conn = db()
     cur = conn.execute(
         "UPDATE users SET password_hash=? WHERE username=?",
-        (generate_password_hash(password), username)
+        (generate_password_hash(password), username),
     )
+
+    # Revoke other sessions for this user so the new password takes effect cleanly.
+    conn.execute(
+        """
+        UPDATE sessions SET revoked=1
+        WHERE user_id=(SELECT id FROM users WHERE username=?)
+          AND token<>?
+        """,
+        (username, bearer() or ""),
+    )
+
     conn.commit()
     conn.close()
 
@@ -447,6 +580,10 @@ def change_password(username):
 
     return jsonify({"ok": True})
 
+
+# =========================================================
+# ADMIN - EVENTS
+# =========================================================
 
 @APP.get("/api/admin/events")
 @require_admin
@@ -462,17 +599,22 @@ def admin_events():
     ).fetchall()
     conn.close()
 
-    return jsonify({
-        "ok": True,
-        "events": [dict(row) for row in rows]
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "events": [dict(row) for row in rows],
+        }
+    )
 
+
+# =========================================================
+# STARTUP
+# =========================================================
 
 init_db()
 
 if __name__ == "__main__":
     print("BlackAngels Sentinel Admin Server")
+    print("Database:", DB_PATH)
     print("Bootstrap admin:", os.environ.get("BA_ADMIN_USER", "blackangels"))
-    print("Admin credentials initialized.")
-
     APP.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
